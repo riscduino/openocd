@@ -2,7 +2,6 @@
 
 /***************************************************************************
  *   Copyright (C) 2024 by Dinesh Annayya <dinesh@siplusplus.com>       *
- *   Copyright (C) 2024 by Dinesh Annayya <dinesh@bigendiansemi.com>    *
  ***************************************************************************/
 
 /* The Riscudino Quad SPI controller 
