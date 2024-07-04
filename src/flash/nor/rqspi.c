@@ -21,7 +21,10 @@
 #include <target/algorithm.h>
 #include "target/riscv/riscv.h"
 
-/* Register offsets */
+#define ADDR_SPACE_GLBL          0x10020000
+#define GLBL_CFG_CHIP_REVISION   0x48
+
+/* QSPIM Register offsets */
 
 #define RQSPIM_GLBL_CTRL          0x00
 #define RQSPIM_DMEM_G0_RD_CTRL    0x04
@@ -166,7 +169,7 @@ static int rqspi_wip(struct flash_bank *bank, int timeout)
     curtime = timeval_ms();
 	endtime = curtime + timeout;
 
-     if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL1, 0x00000001)  != ERROR_OK) return ERROR_FAIL;
+     //if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL1, 0x00000001)  != ERROR_OK) return ERROR_FAIL;
      if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL2, 0x040c0005)  != ERROR_OK) return ERROR_FAIL;
 
 
@@ -190,11 +193,10 @@ static int rqspi_erase_sector(struct flash_bank *bank, int sector)
     uint32_t wrData;
     LOG_INFO("Erasing Sector: %x Start Addr: 0x%x and End Addr: 0x%x ", sector, sector * 0x10000, ((sector+1) * 0x10000)-1);
 
-	if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL1, 0x1)                 != ERROR_OK) return ERROR_FAIL;
+	rqspi_write_reg(bank, RQSPIM_IMEM_CTRL1, 0x1); // Write One Time
+						       //
 	if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL2, RQSPIM_WREN)         != ERROR_OK) return ERROR_FAIL;
 	if (rqspi_write_reg(bank, RQSPIM_IMEM_WDATA, 0x0)                 != ERROR_OK) return ERROR_FAIL;
-
-	if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL1, 0x1)                 != ERROR_OK) return ERROR_FAIL;
 
     wrData =  (0x2 << 20) | (P_FSM_CA  << 16)| RQSPIM_64KB_SECTOR_ERASE;
 	if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL2, wrData)              != ERROR_OK) return ERROR_FAIL;
@@ -270,10 +272,13 @@ static int rqspi_flash_write_cmd(struct flash_bank *bank,uint32_t offset, uint32
 
 	if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL2, 0x00000006)    != ERROR_OK) return ERROR_FAIL;
 	if (rqspi_write_reg(bank, RQSPIM_IMEM_WDATA, 0x00000000)    != ERROR_OK) return ERROR_FAIL;
-	if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL1, 0x00000001)    != ERROR_OK) return ERROR_FAIL;
-    cmd = 0x00270002 | burst_size << 24;
-	if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL2, cmd)       != ERROR_OK) return ERROR_FAIL;
-	if (rqspi_write_reg(bank, RQSPIM_IMEM_ADDR, offset)         != ERROR_OK) return ERROR_FAIL;
+	// burst size is split in two bytes 
+	// cmd[31:24] = burst_size[7:0] & 
+	// cmd[23:22] = burst_size[9:8] 
+        cmd = 0x00270002 | (burst_size & 0xFF) << 24;
+        cmd |= ((burst_size >> 8) & 0x3) << 22;
+	if (rqspi_write_reg(bank, RQSPIM_IMEM_CTRL2, cmd)     != ERROR_OK) return ERROR_FAIL;
+	if (rqspi_write_reg(bank, RQSPIM_IMEM_ADDR, offset)   != ERROR_OK) return ERROR_FAIL;
 
    return ERROR_OK;
 
@@ -284,10 +289,10 @@ static int rqspi_flash_write_cmd(struct flash_bank *bank,uint32_t offset, uint32
 
 static int rqspi_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t offset, uint32_t count)
 {
+	uint32_t chip_version;
 	struct target *target = bank->target;
 	struct rqspi_flash_bank *rqspi_info = bank->driver_priv;
 	uint32_t dataout,ncnt,addr,tcnt,burst_size;
-	uint32_t writeData,readData,raddr,rcnt;
 
 	LOG_DEBUG("bank->size=0x%x offset=0x%08" PRIx32 " count=0x%08" PRIx32,
 			bank->size, offset, count);
@@ -301,6 +306,10 @@ static int rqspi_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t 
 		LOG_WARNING("Write past end of flash. Extra data discarded.");
 		count = rqspi_info->dev->size_in_bytes - offset;
 	}
+
+	// Check the Version ID
+	target_read_u32(target, ADDR_SPACE_GLBL+ GLBL_CFG_CHIP_REVISION, &chip_version);
+	LOG_INFO("CHIP VERSION: %x", chip_version);
 
 	/* Check sector protection */
 	for (unsigned int sector = 0; sector < bank->num_sectors; sector++) {
@@ -320,14 +329,18 @@ static int rqspi_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t 
    dataout = 0;
    ncnt = 0;
    tcnt = 0;
-   rcnt = 0;
-
-   raddr = 0;
 
    // As Max 256 Byte Write Burst is supported by External Flash, we are spliting the burst in multiple of 128 Byte
 
    do {
-       burst_size = (count-tcnt) > 128 ? 128 : (count-tcnt);
+       // From Chip Version 8.6 onwards Data burst size increase from [7:0] to [9:0]
+       if(chip_version >= 0x86000) { 
+          burst_size = (count-tcnt) >= 256 ? 256 : (count-tcnt);
+       } else {
+          burst_size = (count-tcnt) >= 128 ? 128 : (count-tcnt);
+       }
+       if((addr %1000) == 0x00)
+          LOG_INFO("Writing Flash Address: 0x%08x", addr);
 
        // Setup the command
        rqspi_flash_write_cmd(bank,addr, burst_size);
@@ -357,30 +370,6 @@ static int rqspi_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t 
         // check for Busy command
 	    if (rqspi_wip(bank, RQSPI_MAX_TIMEOUT) != ERROR_OK) return ERROR_FAIL;
 
-        /** Read Back and validate  **/
-       ncnt = 0;
-       writeData = 0;
-       readData = 0;
-       for(uint32_t i =0; i < burst_size; i++) {
-            int tShift = (8 * ncnt);
-            writeData |= buffer[rcnt] << tShift; 
-            ncnt = ncnt + 1;
-            if(ncnt == 4){
-	           int result = target_read_u32(target, 0x04000000 + raddr, &readData);
-	           if (result == ERROR_OK) {
-                  if(readData != writeData) { 
-                     return ERROR_FAIL;
-                  } 
-
-               }
-               raddr = raddr+4;
-               ncnt = 0;
-               writeData = 0x00;
-            }
-            rcnt++;
-        }
-
-
      } while(tcnt != count);
 
 
@@ -388,6 +377,33 @@ static int rqspi_write(struct flash_bank *bank, const uint8_t *buffer, uint32_t 
 
 }
 static int rqspi_verify(struct flash_bank *bank, const uint8_t *buffer, uint32_t offset, uint32_t count) {
+
+	struct target *target = bank->target;
+	uint32_t writeData,readData;
+	uint32_t ncnt;
+        /** Read Back and validate  **/
+       ncnt = 0;
+       writeData = 0;
+       readData = 0;
+       for(uint32_t i =0; i < count; i++) {
+            int tShift = (8 * ncnt);
+            writeData |= buffer[i] << tShift; 
+            ncnt = ncnt + 1;
+            if(ncnt == 4){
+	       int result = target_read_u32(target, 0x04000000 + offset+(i*4), &readData);
+	       if (result == ERROR_OK) {
+                 if(readData != writeData) { 
+                     LOG_INFO("ERROR: Read check Failed Address: 0x%08x Exp: %08x Rxd:%d", offset+(i*4), writeData, readData);
+                     return ERROR_FAIL;
+                 } 
+               } else {
+                   LOG_INFO("ERROR: Read check Error Response");
+                   return ERROR_FAIL;
+	       }
+               ncnt = 0;
+               writeData = 0x00;
+            }
+        }
 
 	return ERROR_OK;
 
@@ -427,6 +443,10 @@ static int rqspi_probe(struct flash_bank *bank)
 	uint32_t id = 0; /* silence uninitialized warning */
 	const struct rqspi_target *target_device;
 	uint32_t sectorsize;
+    
+	
+	// Since RQSPIM_IMEM_CTRL1 is always 0x01; we are configuring it one time and removed in loop for each write
+	rqspi_write_reg(bank, RQSPIM_IMEM_CTRL1, 0x00000001);
 
 	if (rqspi_info->probed)
 		free(bank->sectors);
